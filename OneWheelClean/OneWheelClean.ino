@@ -3,13 +3,13 @@
 
 #include "VescUart.h"
 
-VescUart UART;
-
 /*
 TODO:
- - Add error condition - blink all LEDs  
+ - Add bluetooth link to phone for status on the go
 
  */
+ 
+VescUart UART;
 
 // packet that we read from the read_mpu function
 struct IMU_packet
@@ -35,6 +35,8 @@ bool fsr_board_stay_on();
 // output IMU global values
 double pitch, roll, yaw;
 
+bool battery_dead = false;
+
 // calibration values from our calibration function
 long gx_cal = 219;
 long gy_cal = 187;
@@ -47,19 +49,23 @@ long az_cal = 372;
 double CENTER_ANGLE = 0.0;
 
 // motor control
-double __P = 70;
-double __I = 0.5;
-double __D = 125;
+// double __P = 37.5;
+// double __I = 0.1;
+// double __D = 260;
+
+double __P = 35;
+double __I = 3;
+double __D = 400;
 double pid_total, pid_i;
 int PWM_PIN = 11;
 
 // FSR stuff - pin definitions (analog lines)
-int FSR_1 = 0;
+int FSR_1 = 2;
 int FSR_2 = 1;
 
-bool _verbose = true;
+bool _verbose = 1;
 
-// easy to config as a servo, note: library modified to run at 250Hz
+// easy to config as a servo
 Servo vesc;
 
 // LEDs to indicate states: subject to change
@@ -67,22 +73,28 @@ int led_off = 8;
 int led_start = 9;
 int led_ride = 10;
 
-// read these at startup
-int FSR1_THRESHOLD_ON = 50;
-int FSR2_THRESHOLD_ON = 50;
+// these work ok
+int FSR1_THRESHOLD_ON = 350;
+int FSR2_THRESHOLD_ON = 350;
 
 // states to dictate what mode the wheel is in
 #define OFF                     1
 #define START                   2
 #define RIDE                    3
 #define ERROR_                  4
+#define DEAD                    0         // battery death
+#define NUM_CELLS               12        // 12s pack
+#define LOW_LOW_V_CUTOFF        2.8
+#define LOW_V_CUTOFF            3.0
 #define CENTER_THROTTLE         1500      // send 1500 signal for no motion
 #define START_STABLE_THRESH     2         // safe start only within 2 deg of level
 #define CUTOFF_THRESHOLD        20        // num loops before FSR not pressed turns off board
 #define PITCH_CUTOFF            22        // angle at which cutoff occurs
 #define ROLL_CUTOFF             28        // angle at which cutoff occurs (primary!)
 #define PID_REFRESH_RATE        250       // Hz - rate that we run PID loop
-#define eRPM_CUTOFF_LIMIT        300       // only turn off if motor is moving less than this
+#define eRPM_CUTOFF_LIMIT       300       // only turn off if motor is moving less than this
+
+
 void setup()
 {
   // configure LEDs to be outputs
@@ -114,18 +126,7 @@ void setup()
   // setup for the gyro, calibrate if necessary
   init_mpu_6050();
   //calibrate_gyro();
-
-  // get FSR baseline readings
-  FSR1_THRESHOLD_ON = 0;
-  FSR2_THRESHOLD_ON = 0;
-  for (int i = 0; i < 5; i ++)
-  {
-    FSR1_THRESHOLD_ON += analogRead(FSR_1);
-    FSR2_THRESHOLD_ON += analogRead(FSR_2);
-  }
-  FSR1_THRESHOLD_ON = FSR1_THRESHOLD_ON/5 - 50;
-  FSR2_THRESHOLD_ON = FSR2_THRESHOLD_ON/5 - 50;
-
+    
   // signal we're good to go
   digitalWrite(led_off, HIGH);
   digitalWrite(led_start, LOW);
@@ -136,8 +137,8 @@ void loop()
 {
   // determines if we want to turn anything on
   static int STATE = OFF;
-  static int hysteresis = 0; // use this to track if we need to cutoff
-  static int lc = 0; // loop counter
+  static int hysteresis = 0;  // use this to track if we need to cutoff
+  static int lc = 0;  // loop counter
   
   // use this to make sure we update at the correct rate (250 Hz)
   long loop_start = micros();
@@ -165,6 +166,12 @@ void loop()
   
   // pid_total will max at +/- pid_total
   double pwm_signal = CENTER_THROTTLE + pid_total;
+
+  // summarize state in a nice string - maybe send to BLE module one day
+  String s = " ";
+  String t = "\t";
+  String output = STATE+t+FSR1_THRESHOLD_ON+s+analogRead(FSR_1)+s+FSR2_THRESHOLD_ON+
+                    s+analogRead(FSR_2)+t+roll+s+pitch+t+pwm_signal;
 
   /////////////////////////////////////////////////////////////////////////////////////
   // Now, update motor speed based on state and PID
@@ -229,49 +236,79 @@ void loop()
 
       if (hysteresis > CUTOFF_THRESHOLD)
         STATE = OFF;
+
+      // only turn off if we're going at a safe speed (slowly...)
+      if (battery_dead && abs(UART.data.rpm) < eRPM_CUTOFF_LIMIT)
+        STATE = DEAD;
         
       break;
 
     case ERROR_:
       vesc.writeMicroseconds(CENTER_THROTTLE);
       break;
-  }
 
-  // print an update if we need it
-  if (_verbose)
-  {
-    String s = " ";
-    String t = "\t";
-    String output = STATE+t+FSR1_THRESHOLD_ON+s+analogRead(FSR_1)+s+FSR2_THRESHOLD_ON+
-              s+analogRead(FSR_2)+t+roll+s+pitch+t+pwm_signal;
-
-    // this takes a long time, so only do it at 10Hz, or every 25 loops
-    if (lc % 25 == 0)
-    {
-      if (UART.getVescValues())
+    case DEAD:
+      vesc.writeMicroseconds(CENTER_THROTTLE);
+      if (lc % 60 < 20)
       {
-        output = output+t+UART.data.rpm+s+UART.data.inpVoltage;
-        if (STATE == ERROR_) // we can break out of the error condition
-          STATE = OFF;
+        digitalWrite(led_off, HIGH);
+        digitalWrite(led_start, LOW);
+        digitalWrite(led_ride, LOW);
+      }
+      else if (lc % 60 < 40)
+      {
+        digitalWrite(led_off, LOW);
+        digitalWrite(led_start, HIGH);
+        digitalWrite(led_ride, LOW);
       }
       else
       {
-        // toggle LED to show error
-        digitalWrite(led_off, !digitalRead(led_off));
-        output = output+"\tNO VESC DETECTED (check UART)";
-        STATE = ERROR_;
-      } 
-      lc = 0;
-    }
-    lc ++;
-    
-    output = output+t+(micros()-loop_start);
-    Serial.println(output);
+        digitalWrite(led_off, LOW);
+        digitalWrite(led_start, LOW);
+        digitalWrite(led_ride, HIGH);
+      }
+      output = output+"\tBATTERY DEAD, PLEASE CHARGE.";
+      break;
   }
+
+  // this takes a long time, so only do it at 1Hz, or every 250 loops
+  if (lc % 250 == 0)
+  {
+    if (UART.getVescValues())
+    {
+      output = output+t+UART.data.rpm+s+UART.data.inpVoltage+s+UART.data.dutyCycleNow+
+                s+UART.data.tachometer+s+UART.data.avgMotorCurrent;
+      if (STATE == ERROR_) // we can break out of the error condition
+        STATE = OFF;
+
+      /*
+          Low-Battery cutoff:
+            - 2.8v/cell: turn off no matter what - safer than sorry
+            - 3.0v/cell: don't turn off unless duty cycle is < 25%
+      */
+      if (UART.data.inpVoltage < NUM_CELLS * LOW_LOW_V_CUTOFF)  // protects us in hill climb scenario
+        battery_dead = true;
+      if (UART.data.inpVoltage < NUM_CELLS * LOW_V_CUTOFF && abs(UART.data.dutyCycleNow) < 25)
+        battery_dead = true;
+    }
+    else
+    {
+      // toggle LED to show error -- VESC not connected
+      digitalWrite(led_off, !digitalRead(led_off));
+      output = output+"\tNO VESC DETECTED (check UART)";
+      STATE = ERROR_;
+    } 
+    lc = 0;
+  }
+  lc ++;
   
-  /////////////////////////////////////////////////////////////////////////////////////
+  output = output+t+(micros()-loop_start);
+
+  // only print if we asked for it
+  if (_verbose)
+    Serial.println(output);
+  
   // make sure we keep loop time
-  /////////////////////////////////////////////////////////////////////////////////////
   bool on_time = false;
   while (micros() - loop_start < int(1000000 / PID_REFRESH_RATE))
   {
@@ -280,10 +317,8 @@ void loop()
   }
   if (!on_time)
     digitalWrite(13, HIGH);
-  /////////////////////////////////////////////////////////////////////////////////////
-  /////////////////////////////////////////////////////////////////////////////////////
-  /////////////////////////////////////////////////////////////////////////////////////
 }
+
 
 // helper function to reliably check whether the board TURN ON based on FSRs
 bool fsr_board_start()
@@ -300,6 +335,7 @@ bool fsr_board_start()
   else
     return false;
 }
+
 
 // helper function to reliably check whether the board TURN ON based on FSRs
 bool fsr_board_stay_on()
@@ -335,6 +371,7 @@ bool fsr_board_stay_on()
   return false;
 }
 
+
 // start communication with the 6050
 void init_mpu_6050() 
 {
@@ -355,6 +392,7 @@ void init_mpu_6050()
   Wire.endTransmission();                                               // End the transmission
 }
 
+
 // read values from 6050
 struct IMU_packet read_mpu_6050() 
 {
@@ -374,6 +412,7 @@ struct IMU_packet read_mpu_6050()
 
   return p;
 }
+
 
 // update angle based on readings
 void update_state()
@@ -428,6 +467,7 @@ void update_state()
   roll = roll * 0.9 + a_r_gyro * 0.1;       // Take 90% of the output roll value and add 10% of the raw roll value
   yaw = yaw * 0.9 + a_y_gyro * 0.1;          // Might as well stick a comp filter on the yaw too!
 }
+
 
 // manually called function to calibrate
 void calibrate_gyro()
